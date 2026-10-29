@@ -1,0 +1,10 @@
+# secrets and local files
+.env
+
+# build output
+/bridge
+/out/
+/vikunja-notification-bridge
+
+# editor cruft
+.DS_Store

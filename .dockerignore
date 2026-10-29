@@ -1,0 +1,9 @@
+.git
+.env*
+!.env.example
+bridge
+out/
+vikunja-notification-bridge
+GO-REVIEW.md
+README.md
+docker-compose.yml

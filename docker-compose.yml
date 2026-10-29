@@ -1,0 +1,15 @@
+services:
+  bridge:
+    build: .
+    image: vikunja-notification-bridge:latest
+    env_file: .env
+    ports:
+      - "127.0.0.1:18080:8080"   # local only, Caddy fronts this on the public host
+    restart: unless-stopped
+    # If Vikunja runs in another compose project on the same host, attach to the
+    # same external Docker network so the internal webhook URL resolves:
+    # networks: [vikunja-net]
+    # networks:
+    #   vikunja-net:
+    #     external: true
+    #     name: vikunja_default   # adjust to your actual network name
