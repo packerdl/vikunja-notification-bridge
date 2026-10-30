@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -41,9 +42,7 @@ type Config struct {
 	PublicBaseURL  string // public HTTPS base used inside the button URL
 	ReminderSecret string // path secret for the reminder webhook
 	DoneSecret     string // path secret for the mark-done button
-	CancelSecret   string
 	SignSecret     string // empty disables X-Vikunja-Signature verification
-	AuthHeader     bool   // also require an Authorization Bearer header
 	DedupeWindow   time.Duration
 	RequestTimeout time.Duration
 	TitlePrefix    string
@@ -88,9 +87,7 @@ func loadConfig() (*Config, error) {
 	}
 	c.NTFYToken = opt("NTFY_TOKEN", "")
 	c.VikunjaIconURL = opt("VIKUNJA_ICON_URL", "https://vikunja.io/favicon.ico")
-	c.CancelSecret = opt("CANCEL_SECRET", "")
 	c.SignSecret = os.Getenv("VIKUNJA_WEBHOOK_SECRET") // empty = disabled
-	c.AuthHeader = os.Getenv("VIKUNJA_WEBHOOK_AUTH_HEADER") == "true"
 	c.TitlePrefix = opt("NOTIFICATION_PREFIX", "⏰ ")
 	c.ListenAddr = opt("LISTEN_ADDR", ":8080")
 	c.DedupeWindow = 2 * time.Minute
@@ -162,16 +159,11 @@ func newDedupe(window time.Duration) *deduper {
 	return &deduper{seen: make(map[string]time.Time), window: window}
 }
 
-// recent does not refresh the timestamp on a hit: the window counts from
-// first observation, so a looping key eventually leaks through again.
-func (d *deduper) recent(key string) bool {
-	d.mu.Lock()
-	t, ok := d.seen[key]
-	d.mu.Unlock()
-	return ok && time.Since(t) < d.window
-}
-
-func (d *deduper) mark(key string) {
+// claim checks and records in one locked step so two near-simultaneous
+// deliveries of the same reminder cannot both pass. A hit does not refresh
+// the timestamp, the window counts from first observation, so a looping key
+// eventually leaks through again.
+func (d *deduper) claim(key string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if len(d.seen) > 1000 {
@@ -182,8 +174,19 @@ func (d *deduper) mark(key string) {
 			}
 		}
 	}
+	if t, ok := d.seen[key]; ok && time.Since(t) < d.window {
+		return false
+	}
 	// The map is uncapped, acceptable at personal reminder volume.
 	d.seen[key] = time.Now()
+	return true
+}
+
+// forget releases a failed claim so Vikunja redelivers the reminder.
+func (d *deduper) forget(key string) {
+	d.mu.Lock()
+	delete(d.seen, key)
+	d.mu.Unlock()
 }
 
 // sanitizeTitle keeps task titles from smuggling line breaks or other control
@@ -253,14 +256,15 @@ func (c *Config) handleReminder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dedupeKey := fmt.Sprintf("task=%d@%s", taskID, ev.Data.Reminder.Reminder)
-	if dedupe.recent(dedupeKey) {
+	if !dedupe.claim(dedupeKey) {
 		log.Info("duplicate reminder suppressed", "task_id", taskID, "key", dedupeKey)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Ack Vikunja before publishing. The dedupe key is recorded only after a
-	// successful send, so a failed publish leaves Vikunja free to redeliver.
+	// Ack Vikunja before publishing. The key is claimed before the 204, so a
+	// double delivery closes the race that would buzz the phone twice. A
+	// failed send forgets the claim, letting the retry publish.
 	w.WriteHeader(http.StatusNoContent)
 
 	taskTitle := ev.Data.Task.Title
@@ -281,11 +285,11 @@ func (c *Config) handleReminder(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), c.RequestTimeout)
 		defer cancel()
 		if err := c.sendNotification(ctx, taskID, taskTitle, projectTitle, reminder, icon); err != nil {
-			// no dedupe record on failure, let Vikunja retry deliver again
+			// release the claim so the retry can deliver again
+			dedupe.forget(dedupeKey)
 			log.Error("ntfy publish failed", "err", err, "task_id", taskID, "title", taskTitle)
 			return
 		}
-		dedupe.mark(dedupeKey)
 		log.Info("notification sent", "task_id", taskID, "title", taskTitle, "project", projectTitle, "reminder", reminder)
 	}()
 }
@@ -383,20 +387,6 @@ func (c *Config) markTaskDone(ctx context.Context, taskID int64) error {
 	return fmt.Errorf("vikunja unexpected status %d: %s", resp.StatusCode, string(b))
 }
 
-// Placeholder, not wired up.
-func (c *Config) handleCancel(w http.ResponseWriter, r *http.Request) {
-	if c.CancelSecret == "" {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	if !equalSecret(strings.Trim(r.PathValue("secret"), "/"), c.CancelSecret) {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-	// TODO clear the notification through ntfy once cancel is wired up
-	w.WriteHeader(http.StatusNotImplemented)
-}
-
 func equalSecret(provided, expected string) bool {
 	if provided == "" || expected == "" {
 		return false
@@ -404,8 +394,9 @@ func equalSecret(provided, expected string) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
 }
 
-// Accepts both hex(HMAC(payload)) and hex(HMAC(timestamp.payload)) shapes.
-// Pin a single canonical format before rolling this out widely.
+// Only hex(HMAC(payload)) is accepted, with an optional sha256= prefix.
+// A timestamp-prefixed variant needs a freshness check, without one any old
+// signature would replay forever, so it is rejected outright.
 func verifySignature(secret, sigHeader string, payload []byte) bool {
 	if sigHeader == "" {
 		return false
@@ -414,19 +405,7 @@ func verifySignature(secret, sigHeader string, payload []byte) bool {
 	mac.Write(payload)
 	wantRaw := hex.EncodeToString(mac.Sum(nil))
 	got := strings.TrimPrefix(sigHeader, "sha256=")
-	if subtle.ConstantTimeCompare([]byte(got), []byte(wantRaw)) == 1 {
-		return true
-	}
-	// "<timestamp>.<hex>" variant, no timestamp freshness check yet.
-	parts := strings.SplitN(got, ".", 2)
-	if len(parts) != 2 {
-		return false
-	}
-	mac2 := hmac.New(sha256.New, []byte(secret))
-	mac2.Write([]byte(parts[0]))
-	mac2.Write(payload)
-	wantDot := hex.EncodeToString(mac2.Sum(nil))
-	return subtle.ConstantTimeCompare([]byte(parts[1]), []byte(wantDot)) == 1
+	return subtle.ConstantTimeCompare([]byte(got), []byte(wantRaw)) == 1
 }
 
 // Prefixes leak secrets, so only log the length.
@@ -435,15 +414,18 @@ func redact(s string) string {
 }
 
 func runHealthcheck() int {
-	addr := strings.TrimPrefix(strings.TrimSpace(os.Getenv("LISTEN_ADDR")), ":")
-	if addr == "" {
-		addr = "8080"
+	addr := strings.TrimSpace(os.Getenv("LISTEN_ADDR"))
+	// Parse the port instead of stripping a leading colon, an explicit host
+	// in LISTEN_ADDR must still probe the port the server listens on.
+	port := "8080"
+	if _, p, err := net.SplitHostPort(addr); err == nil && p != "" {
+		port = p
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("http://127.0.0.1:" + addr + "/healthz")
+	resp, err := client.Get("http://127.0.0.1:" + port + "/healthz")
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
-			fmt.Fprintf(os.Stderr, "healthcheck: %s -> %s\n", addr, resp.Status)
+			fmt.Fprintf(os.Stderr, "healthcheck: %s -> %s\n", port, resp.Status)
 		} else {
 			fmt.Fprintf(os.Stderr, "healthcheck failed: %v\n", err)
 		}
@@ -473,7 +455,6 @@ func main() {
 	})
 	mux.HandleFunc("POST /v1/reminder/{secret}", cfg.handleReminder)
 	mux.HandleFunc("POST /v1/done/{secret}", cfg.handleDone)
-	mux.HandleFunc("POST /v1/cancel/{secret}", cfg.handleCancel)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
