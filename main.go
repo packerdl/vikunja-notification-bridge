@@ -421,6 +421,10 @@ func runHealthcheck() int {
 	if _, p, err := net.SplitHostPort(addr); err == nil && p != "" {
 		port = p
 	}
+	return healthcheck(port)
+}
+
+func healthcheck(port string) int {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get("http://127.0.0.1:" + port + "/healthz")
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -433,6 +437,17 @@ func runHealthcheck() int {
 	}
 	resp.Body.Close()
 	return 0
+}
+
+func newMux(c *Config) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("POST /v1/reminder/{secret}", c.handleReminder)
+	mux.HandleFunc("POST /v1/done/{secret}", c.handleDone)
+	return mux
 }
 
 func main() {
@@ -448,17 +463,9 @@ func main() {
 	}
 	dedupe = newDedupe(cfg.DedupeWindow)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("POST /v1/reminder/{secret}", cfg.handleReminder)
-	mux.HandleFunc("POST /v1/done/{secret}", cfg.handleDone)
-
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           mux,
+		Handler:           newMux(cfg),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,

@@ -1,9 +1,16 @@
 package main
 
 import (
+	"os"
 	"testing"
 	"time"
 )
+
+// The handlers log through the package logger, init it for the whole suite.
+func TestMain(m *testing.M) {
+	initLog()
+	os.Exit(m.Run())
+}
 
 // Real sleeps instead of a fake clock because the deduper is exercised
 // against the wall clock in production, no injection point exists.
