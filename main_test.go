@@ -12,8 +12,6 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// Real sleeps instead of a fake clock because the deduper is exercised
-// against the wall clock in production, no injection point exists.
 func TestDedupeClaimForget(t *testing.T) {
 	tests := []struct {
 		name   string

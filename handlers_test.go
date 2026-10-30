@@ -24,8 +24,8 @@ type hit struct {
 }
 
 // httpSpy records every request it receives and answers with its configured
-// status. The status is only changed between publishes, after notifyWG.Wait
-// has synced the background goroutine, so no lock is needed for it.
+// status. Status flips happen only between publishes, notifyWG.Wait settles
+// the publish goroutine first, so no lock guards status.
 type httpSpy struct {
 	t      *testing.T
 	status int
@@ -71,8 +71,6 @@ func (s *httpSpy) last() hit {
 	return s.hits[len(s.hits)-1]
 }
 
-// bridgeConfig builds a Config pointing both HTTP targets at spies. Scenarios
-// needing a status flip get the same spy object and set its status field.
 func bridgeConfig(t *testing.T, ntfyStatus, vikunjaStatus int) (*Config, *httpSpy, *httpSpy) {
 	ntfy := newSpy(t, ntfyStatus)
 	vik := newSpy(t, vikunjaStatus)
@@ -100,8 +98,6 @@ func serve(c *Config, req *http.Request) *httptest.ResponseRecorder {
 	return w
 }
 
-// sendReminder posts the webhook and waits for the background publish, so
-// assertions always observe a settled state.
 func sendReminder(t *testing.T, c *Config, secret, payload string) int {
 	t.Helper()
 	w := serve(c, httptest.NewRequest(http.MethodPost, "/v1/reminder/"+secret, strings.NewReader(payload)))
@@ -109,8 +105,6 @@ func sendReminder(t *testing.T, c *Config, secret, payload string) int {
 	return w.Code
 }
 
-// Long enough that a test only needs real sleeps to cross it, never hard
-// timing. drainDedupe sleeps past the window.
 const dedupeWindow = 100 * time.Millisecond
 
 func drainDedupe() { time.Sleep(2 * dedupeWindow) }
@@ -313,8 +307,6 @@ func TestDoneCallback(t *testing.T) {
 	})
 }
 
-// startBridge serves the real mux on a free port, exactly what main serves,
-// so wiring bugs like a renamed route cannot hide from the tests.
 func startBridge(t *testing.T, c *Config) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -384,7 +376,6 @@ func TestHealthcheck(t *testing.T) {
 	})
 
 	t.Run("reports unhealthy when nothing listens on the configured port", func(t *testing.T) {
-		// Bind a free port and release it, deterministic nowhere-listening.
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)

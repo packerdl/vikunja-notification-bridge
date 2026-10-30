@@ -9,10 +9,3 @@ services:
     # background notification publishes drain past the default 10s SIGTERM grace
     # a killed publish loses a reminder Vikunja already saw acknowledged
     stop_grace_period: 15s
-    # If Vikunja runs in another compose project on the same host, attach to the
-    # same external Docker network so the internal webhook URL resolves:
-    # networks: [vikunja-net]
-    # networks:
-    #   vikunja-net:
-    #     external: true
-    #     name: vikunja_default   # adjust to your actual network name

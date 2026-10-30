@@ -39,9 +39,9 @@ type Config struct {
 	VikunjaBaseURL string
 	VikunjaToken   string // API token, scope limited to task updates
 	VikunjaIconURL string
-	PublicBaseURL  string // public HTTPS base used inside the button URL
-	ReminderSecret string // path secret for the reminder webhook
-	DoneSecret     string // path secret for the mark-done button
+	PublicBaseURL  string // base of the callback links
+	ReminderSecret string // webhook path secret
+	DoneSecret     string // callback path secret
 	SignSecret     string // empty disables X-Vikunja-Signature verification
 	DedupeWindow   time.Duration
 	RequestTimeout time.Duration
@@ -87,7 +87,7 @@ func loadConfig() (*Config, error) {
 	}
 	c.NTFYToken = opt("NTFY_TOKEN", "")
 	c.VikunjaIconURL = opt("VIKUNJA_ICON_URL", "https://vikunja.io/favicon.ico")
-	c.SignSecret = os.Getenv("VIKUNJA_WEBHOOK_SECRET") // empty = disabled
+	c.SignSecret = os.Getenv("VIKUNJA_WEBHOOK_SECRET")
 	c.TitlePrefix = opt("NOTIFICATION_PREFIX", "⏰ ")
 	c.ListenAddr = opt("LISTEN_ADDR", ":8080")
 	c.DedupeWindow = 2 * time.Minute
@@ -125,7 +125,6 @@ func initLog() {
 	log = slog.New(h)
 }
 
-// A subset of the fields Vikunja's webhook envelope carries.
 type reminderEvent struct {
 	EventName string `json:"event_name"`
 	Time      string `json:"time"`
@@ -138,13 +137,11 @@ type reminderEvent struct {
 			Title string `json:"title"`
 		} `json:"task"`
 		Reminder struct {
-			Reminder string `json:"reminder"` // RFC3339 with offset
+			Reminder string `json:"reminder"`
 		} `json:"reminder"`
 	} `json:"data"`
 }
 
-// notifyWG tracks in-flight notification goroutines so shutdown can wait for
-// them instead of losing a reminder mid-publish.
 var notifyWG sync.WaitGroup
 
 var dedupe *deduper
@@ -159,10 +156,8 @@ func newDedupe(window time.Duration) *deduper {
 	return &deduper{seen: make(map[string]time.Time), window: window}
 }
 
-// claim checks and records in one locked step so two near-simultaneous
-// deliveries of the same reminder cannot both pass. A hit does not refresh
-// the timestamp, the window counts from first observation, so a looping key
-// eventually leaks through again.
+// The window counts from the first observation, no hit refreshes it, so a
+// looping key leaks through again.
 func (d *deduper) claim(key string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -177,12 +172,11 @@ func (d *deduper) claim(key string) bool {
 	if t, ok := d.seen[key]; ok && time.Since(t) < d.window {
 		return false
 	}
-	// The map is uncapped, acceptable at personal reminder volume.
+	// shortcut: the map is uncapped, the sweep keeps it bounded at personal volume
 	d.seen[key] = time.Now()
 	return true
 }
 
-// forget releases a failed claim so Vikunja redelivers the reminder.
 func (d *deduper) forget(key string) {
 	d.mu.Lock()
 	delete(d.seen, key)
@@ -262,9 +256,6 @@ func (c *Config) handleReminder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ack Vikunja before publishing. The key is claimed before the 204, so a
-	// double delivery closes the race that would buzz the phone twice. A
-	// failed send forgets the claim, letting the retry publish.
 	w.WriteHeader(http.StatusNoContent)
 
 	taskTitle := ev.Data.Task.Title
@@ -285,7 +276,6 @@ func (c *Config) handleReminder(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), c.RequestTimeout)
 		defer cancel()
 		if err := c.sendNotification(ctx, taskID, taskTitle, projectTitle, reminder, icon); err != nil {
-			// release the claim so the retry can deliver again
 			dedupe.forget(dedupeKey)
 			log.Error("ntfy publish failed", "err", err, "task_id", taskID, "title", taskTitle)
 			return
@@ -300,7 +290,6 @@ func (c *Config) formatReminderTime(ts string) string {
 		t = time.Now()
 		log.Warn("invalid reminder timestamp, using now", "ts", ts, "err", err)
 	}
-	// Renders as e.g. "Tue, 10/27 at 07:00".
 	return t.Format("Mon, 01/02 at 15:04")
 }
 
@@ -379,7 +368,6 @@ func (c *Config) markTaskDone(ctx context.Context, taskID int64) error {
 		return err
 	}
 	defer resp.Body.Close()
-	// Read once so the error snippet below is populated.
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
 	if resp.StatusCode/100 == 2 {
 		return nil
@@ -394,9 +382,6 @@ func equalSecret(provided, expected string) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
 }
 
-// Only hex(HMAC(payload)) is accepted, with an optional sha256= prefix.
-// A timestamp-prefixed variant needs a freshness check, without one any old
-// signature would replay forever, so it is rejected outright.
 func verifySignature(secret, sigHeader string, payload []byte) bool {
 	if sigHeader == "" {
 		return false
@@ -477,8 +462,6 @@ func main() {
 		"public", cfg.PublicBaseURL,
 		"dedupe_window", cfg.DedupeWindow.String())
 
-	// After SIGTERM, stop accepting and let notification goroutines finish.
-	// Each one is bounded by its own request timeout.
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	serveErr := make(chan error, 1)
