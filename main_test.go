@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -114,4 +115,116 @@ func TestEqualSecret(t *testing.T) {
 			}
 		})
 	}
+}
+
+// setValidEnv loads every required variable with workable values.
+func setValidEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("NTFY_URL", "https://ntfy.example.com/vikunja")
+	t.Setenv("VIKUNJA_BASE_URL", "https://todo.example.com/")
+	t.Setenv("VIKUNJA_TOKEN", "tok")
+	t.Setenv("PUBLIC_BASE_URL", "https://notify.example.com")
+	t.Setenv("REMINDER_SECRET", "reminder-secret")
+	t.Setenv("DONE_SECRET", "done-secret")
+}
+
+func TestLoadConfig(t *testing.T) {
+	t.Run("accepts a valid environment with defaults applied", func(t *testing.T) {
+		setValidEnv(t)
+		c, err := loadConfig()
+		if err != nil {
+			t.Fatalf("loadConfig: %v", err)
+		}
+		if c.VikunjaBaseURL != "https://todo.example.com" {
+			t.Errorf("base url = %q, want the trailing slash trimmed", c.VikunjaBaseURL)
+		}
+		if c.ListenAddr != ":8080" {
+			t.Errorf("listen addr = %q, want :8080", c.ListenAddr)
+		}
+		if c.DedupeWindow != 2*time.Minute {
+			t.Errorf("dedupe window = %s, want 2m", c.DedupeWindow)
+		}
+		if c.RequestTimeout != 10*time.Second {
+			t.Errorf("request timeout = %s, want 10s", c.RequestTimeout)
+		}
+		if c.VikunjaIconURL == "" {
+			t.Errorf("icon url = empty, want the built-in default")
+		}
+	})
+
+	t.Run("rejects a missing required variable", func(t *testing.T) {
+		for _, k := range []string{
+			"NTFY_URL", "VIKUNJA_BASE_URL", "VIKUNJA_TOKEN",
+			"PUBLIC_BASE_URL", "REMINDER_SECRET", "DONE_SECRET",
+		} {
+			t.Run(k, func(t *testing.T) {
+				setValidEnv(t)
+				os.Unsetenv(k)
+				_, err := loadConfig()
+				if err == nil {
+					t.Fatalf("missing %s accepted", k)
+				}
+				if !strings.Contains(err.Error(), k) {
+					t.Errorf("error %q does not name the missing %s", err, k)
+				}
+			})
+		}
+	})
+
+	t.Run("rejects a base url without a scheme", func(t *testing.T) {
+		setValidEnv(t)
+		t.Setenv("VIKUNJA_BASE_URL", "todo.example.com")
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("schemeless base url accepted")
+		}
+	})
+
+	t.Run("rejects a public base url without a scheme", func(t *testing.T) {
+		setValidEnv(t)
+		t.Setenv("PUBLIC_BASE_URL", "notify.example.com")
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("schemeless public url accepted")
+		}
+	})
+
+	t.Run("rejects equal path secrets when signing is off", func(t *testing.T) {
+		setValidEnv(t)
+		t.Setenv("REMINDER_SECRET", "same")
+		t.Setenv("DONE_SECRET", "same")
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("equal path secrets accepted, leaking one would forge the other")
+		}
+	})
+
+	t.Run("allows equal path secrets when signing is configured", func(t *testing.T) {
+		setValidEnv(t)
+		t.Setenv("REMINDER_SECRET", "same")
+		t.Setenv("DONE_SECRET", "same")
+		t.Setenv("VIKUNJA_WEBHOOK_SECRET", "sig")
+		if _, err := loadConfig(); err != nil {
+			t.Fatalf("equal path secrets rejected with signing on: %v", err)
+		}
+	})
+
+	t.Run("tuning overrides apply and invalid ones fall back cleanly", func(t *testing.T) {
+		setValidEnv(t)
+		t.Setenv("DEDUPE_SECONDS", "5")
+		t.Setenv("HTTP_TIMEOUT_SECONDS", "3")
+		c, err := loadConfig()
+		if err != nil {
+			t.Fatalf("loadConfig: %v", err)
+		}
+		if c.DedupeWindow != 5*time.Second || c.RequestTimeout != 3*time.Second {
+			t.Errorf("got dedupe=%s timeout=%s, want 5s/3s", c.DedupeWindow, c.RequestTimeout)
+		}
+		t.Setenv("DEDUPE_SECONDS", "banana")
+		t.Setenv("HTTP_TIMEOUT_SECONDS", "-1")
+		c, err = loadConfig()
+		if err != nil {
+			t.Fatalf("loadConfig: %v", err)
+		}
+		if c.DedupeWindow != 2*time.Minute || c.RequestTimeout != 10*time.Second {
+			t.Errorf("invalid values = dedupe=%s timeout=%s, want the defaults 2m/10s", c.DedupeWindow, c.RequestTimeout)
+		}
+	})
 }
