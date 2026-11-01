@@ -67,11 +67,8 @@ notifications.example.com {
 
 ## Image builds
 
-GitHub Actions builds `linux/amd64` and `linux/arm64` images and pushes them
-to GHCR (`ghcr.io/packerdl/vikunja-notification-bridge`) on `main` and on
-`v*` tags. No extra configuration needed, the workflow token handles it. Pulls
-outside GitHub require a token with `read:packages` unless the image is
-public.
+GitHub Actions publishes `linux/amd64` and `linux/arm64` images to
+`ghcr.io/packerdl/vikunja-notification-bridge` on `main` and `v*` tags.
 
 ## Local testing
 
