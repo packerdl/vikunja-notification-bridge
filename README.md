@@ -1,8 +1,8 @@
 # vikunja-notification-bridge
 
-A small service that receives [Vikunja](https://vikunja.io) task reminder
-webhooks and publishes notifications to self-hosted [ntfy](https://ntfy.sh), with a callback endpoint that completes the task in the Vikunja
-API when the notification is acknowledged.
+A small service that turns [Vikunja](https://vikunja.io) task reminders into
+[ntfy](https://ntfy.sh) notifications. Acknowledging the notification
+completes the task in the Vikunja API.
 
 ```
 task.reminder.fired ──► bridge ──► ntfy notification
@@ -12,12 +12,6 @@ task.reminder.fired ──► bridge ──► ntfy notification
                         │
                         └──► Vikunja API: GET task, POST it back whole with done flipped
 ```
-
-## Notification target
-
-ntfy is the consumer today. Publishing is isolated in a single function, so a
-different consumer can replace it behind the same reminder webhook without
-changing the endpoints.
 
 ## Endpoints
 
@@ -38,14 +32,13 @@ REMINDER_SECRET=$(openssl rand -hex 32)
 DONE_SECRET=$(openssl rand -hex 32)
 ```
 
-The two secrets must differ, the code refuses equal values, so leaking the
+The two secrets must differ. The code rejects equal values, so a leak of the
 callback path cannot forge reminder events.
 
-Vikunja token scopes: **Tasks → Read one and Tasks → Update**. The read scope
-has to be granted: Vikunja's task-update wipes every field the body omits, so
-the done endpoint reads the task and posts it back with done flipped, and a
-partial write would erase a recurring reminder's repeat configuration.
-ntfy token scope: publish for the bridge topic.
+Vikunja token scopes: **Tasks → Read one, Tasks → Update**. Both are needed.
+A POST update wipes every field the body does not include, so the done
+endpoint reads the task first and posts the whole record back with done
+flipped. ntfy token scope: publish for the bridge topic.
 
 ## Webhook registration
 
@@ -78,18 +71,11 @@ GitHub Actions builds `linux/amd64` and `linux/arm64` images and pushes them
 to Docker Hub on `main` and on `v*` tags. Configure the repository variable
 `DOCKERHUB_NAMESPACE` and the secret `DOCKERHUB_TOKEN`.
 
-## Validation notes
-
-- Callback reads the task (`GET /api/v1/tasks/{id}`) and posts the raw record
-  back whole with `done` flipped (`POST`; PUT and PATCH return 405). A partial
-  body would wipe repeats and reminders, and a struct-typed echo would drop
-  any field Go does not know (go-vikunja issue 1459).
-- Reminder body renders as `Reminder at Tue, 10/27 at 07:00 · *Inbox*`.
-
 ## Local testing
 
 ```sh
 # notification, simulates the Vikunja webhook payload
+# renders on the phone as: Reminder at Tue, 10/27 at 07:00 · *Inbox*
 curl -s http://127.0.0.1:8080/v1/reminder/<SECRET> -H 'Content-Type: application/json' \
   -d '{"event_name":"task.reminder.fired","time":"2026-10-27T11:00:00Z","data":{\
 "project":{"title":"Inbox"},"task":{"id":42,"title":"Test"},"reminder":{"reminder":"2026-10-27T07:00:00-04:00"}}}'
