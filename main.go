@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -354,25 +355,59 @@ func (c *Config) handleDone(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// Vikunja's task update wipes any field absent from the request body
+// (go-vikunja issue 1459), so the done flow reads the task and posts the raw
+// record back with only done flipped; a partial body would erase recurring
+// reminders, and an echo through a struct would drop every field it does not
+// know about.
 func (c *Config) markTaskDone(ctx context.Context, taskID int64) error {
 	url := fmt.Sprintf("%s/api/v1/tasks/%d", c.VikunjaBaseURL, taskID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(`{"done":true}`))
+
+	// Read the current task record, then send it back verbatim with done
+	// flipped, so Vikunja never sees a partial update.
+	get, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.VikunjaToken)
-	req.Header.Set("Content-Type", "application/json")
-	// Sending only the `done` field works. PUT and PATCH return 405.
-	resp, err := c.vikunjaHTTP.Do(req)
+	get.Header.Set("Authorization", "Bearer "+c.VikunjaToken)
+	getResp, err := c.vikunjaHTTP.Do(get)
+	if err != nil {
+		return err
+	}
+	defer getResp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(getResp.Body, 1<<20))
+	if getResp.StatusCode/100 != 2 {
+		return fmt.Errorf("vikunja task read status %d: %s", getResp.StatusCode, body)
+	}
+	var task map[string]any
+	if err := json.Unmarshal(body, &task); err != nil {
+		return fmt.Errorf("vikunja task decode: %w", err)
+	}
+	task["done"] = true
+	// done_at is stamped by Vikunja on completion, a stale echo would
+	// misreport when the task was finished
+	delete(task, "done_at")
+
+	out, err := json.Marshal(task)
+	if err != nil {
+		return err
+	}
+	post, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(out))
+	if err != nil {
+		return err
+	}
+	post.Header.Set("Authorization", "Bearer "+c.VikunjaToken)
+	post.Header.Set("Content-Type", "application/json")
+	resp, err := c.vikunjaHTTP.Do(post)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+	ack, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
 	if resp.StatusCode/100 == 2 {
 		return nil
 	}
-	return fmt.Errorf("vikunja unexpected status %d: %s", resp.StatusCode, string(b))
+	return fmt.Errorf("vikunja unexpected status %d: %s", resp.StatusCode, string(ack))
 }
 
 func equalSecret(provided, expected string) bool {

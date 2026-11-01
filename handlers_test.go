@@ -4,11 +4,13 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -20,18 +22,21 @@ import (
 // Nothing inside the bridge is mocked.
 
 type hit struct {
-	path, auth, title, actions, click, body string
+	method, path, auth, title, actions, click, body string
 }
 
 // httpSpy records every request it receives and answers with its configured
 // status. Status flips happen only between publishes, notifyWG.Wait settles
-// the publish goroutine first, so no lock guards status.
+// the publish goroutine first, so no lock guards status. GETs (the done
+// handler's task read) are answered with getBody and 200 unless getFails.
 type httpSpy struct {
 	t      *testing.T
 	status int
 
-	mu   sync.Mutex
-	hits []hit
+	mu       sync.Mutex
+	hits     []hit
+	getBody  string
+	getFails bool
 
 	server *httptest.Server
 }
@@ -42,6 +47,7 @@ func newSpy(t *testing.T, status int) *httpSpy {
 		b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		s.mu.Lock()
 		s.hits = append(s.hits, hit{
+			method:  r.Method,
 			path:    r.URL.Path,
 			auth:    r.Header.Get("Authorization"),
 			title:   r.Header.Get("Title"),
@@ -50,6 +56,21 @@ func newSpy(t *testing.T, status int) *httpSpy {
 			body:    string(b),
 		})
 		s.mu.Unlock()
+		if r.Method == http.MethodGet {
+			s.mu.Lock()
+			fails, getBody := s.getFails, s.getBody
+			s.mu.Unlock()
+			if fails {
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte(`{"code":4002,"message":"This task does not exist"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			if getBody != "" {
+				w.Write([]byte(getBody))
+			}
+			return
+		}
 		w.WriteHeader(s.status)
 	}))
 	t.Cleanup(s.server.Close)
@@ -257,6 +278,12 @@ func TestReminderWebhook(t *testing.T) {
 	})
 }
 
+const cannedTask = `{"id":42,"title":"Medication","description":"take pills","done":false,` +
+	`"due_date":"2026-10-31T06:00:00-04:00","priority":3,"percent_done":0,` +
+	`"repeat_after":86400,"repeat_mode":0,` +
+	`"reminders":[{"reminder":"2026-10-31T06:00:00-04:00","relative_period":0,"relative_to":""}],` +
+	`"hex_color":"","end_date":"0001-01-01T00:00:00Z","start_date":"0001-01-01T00:00:00Z"}`
+
 func TestDoneCallback(t *testing.T) {
 	t.Run("rejects a wrong path secret without calling Vikunja", func(t *testing.T) {
 		c, _, vik := bridgeConfig(t, 200, 200)
@@ -280,26 +307,55 @@ func TestDoneCallback(t *testing.T) {
 		}
 	})
 
-	t.Run("completes the task through the Vikunja API", func(t *testing.T) {
+	t.Run("completes the task by echoing it back with done flipped", func(t *testing.T) {
+		// A partial body erases fields Vikunja does not receive, so the read
+		// then full write is the contract (go-vikunja issue 1459).
 		c, _, vik := bridgeConfig(t, 200, 200)
+		vik.getBody = cannedTask
 		w := serve(c, httptest.NewRequest(http.MethodPost, "/v1/done/done-secret?task=42", nil))
 		if w.Code != http.StatusOK {
 			t.Errorf("status = %d, want 200", w.Code)
 		}
-		h := vik.last()
-		if h.path != "/api/v1/tasks/42" {
-			t.Errorf("path = %q, want /api/v1/tasks/42", h.path)
+		get := vik.hits[0]
+		if get.method != http.MethodGet || get.path != "/api/v1/tasks/42" {
+			t.Errorf("first call = %s %s, want GET /api/v1/tasks/42", get.method, get.path)
 		}
-		if h.auth != "Bearer vikunja-token" {
-			t.Errorf("authorization = %q", h.auth)
+		post := vik.last()
+		if post.method != http.MethodPost || post.path != "/api/v1/tasks/42" {
+			t.Errorf("last call = %s %s, want POST /api/v1/tasks/42", post.method, post.path)
 		}
-		if h.body != `{"done":true}` {
-			t.Errorf("body = %q, want {\"done\":true}", h.body)
+		if post.auth != "Bearer vikunja-token" {
+			t.Errorf("authorization = %q", post.auth)
+		}
+
+		// The raw record must come back whole, only done flipped and done_at
+		// dropped for Vikunja to restamp.
+		var got, want map[string]any
+		if err := json.Unmarshal([]byte(post.body), &got); err != nil {
+			t.Fatalf("posted body is not json: %v", err)
+		}
+		if err := json.Unmarshal([]byte(cannedTask), &want); err != nil {
+			t.Fatal(err)
+		}
+		want["done"] = true
+		delete(want, "done_at")
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("posted body should be the task with done flipped, diff got %v want %v", got, want)
+		}
+	})
+
+	t.Run("reports the missing task as 502 without posting", func(t *testing.T) {
+		c, _, vik := bridgeConfig(t, 200, 200)
+		vik.getFails = true
+		w := serve(c, httptest.NewRequest(http.MethodPost, "/v1/done/done-secret?task=999999999", nil))
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("status = %d, want 502", w.Code)
 		}
 	})
 
 	t.Run("surfaces a Vikunja failure as 502", func(t *testing.T) {
-		c, _, _ := bridgeConfig(t, 200, 500)
+		c, _, vik := bridgeConfig(t, 200, 500)
+		vik.getBody = cannedTask
 		w := serve(c, httptest.NewRequest(http.MethodPost, "/v1/done/done-secret?task=42", nil))
 		if w.Code != http.StatusBadGateway {
 			t.Errorf("status = %d, want 502", w.Code)
@@ -322,6 +378,7 @@ func startBridge(t *testing.T, c *Config) string {
 func TestRunningBridge(t *testing.T) {
 	t.Run("a reminder flows through to a completed task end to end", func(t *testing.T) {
 		c, ntfy, vik := bridgeConfig(t, 200, 200)
+		vik.getBody = cannedTask
 		dedupe = newDedupe(dedupeWindow)
 		base := startBridge(t, c)
 
@@ -347,8 +404,12 @@ func TestRunningBridge(t *testing.T) {
 		if done.StatusCode != http.StatusOK {
 			t.Errorf("done status = %d, want 200", done.StatusCode)
 		}
-		if v := vik.last(); v.body != `{"done":true}` {
-			t.Errorf("vikunja body = %q, want {\"done\":true}", v.body)
+		post := vik.last()
+		if post.method != http.MethodPost {
+			t.Errorf("last vikunja call = %s, want POST", post.method)
+		}
+		if !strings.Contains(post.body, `"done":true`) {
+			t.Errorf("vikunja body = %q, want carried done true", post.body)
 		}
 	})
 

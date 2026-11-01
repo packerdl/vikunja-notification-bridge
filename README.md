@@ -10,7 +10,7 @@ task.reminder.fired ──► bridge ──► ntfy notification
                                         ▼ acknowledge
                     bridge ◄── POST /v1/done/<secret>?task=<id>
                         │
-                        └──► Vikunja API: POST /api/v1/tasks/{id} {"done":true}
+                        └──► Vikunja API: GET task, POST it back whole with done flipped
 ```
 
 ## Notification target
@@ -41,8 +41,11 @@ DONE_SECRET=$(openssl rand -hex 32)
 The two secrets must differ, the code refuses equal values, so leaking the
 callback path cannot forge reminder events.
 
-Vikunja token scope: **Tasks → Update** only. ntfy token scope: publish for
-the bridge topic.
+Vikunja token scopes: **Tasks → Read one and Tasks → Update**. The read scope
+has to be granted: Vikunja's task-update wipes every field the body omits, so
+the done endpoint reads the task and posts it back with done flipped, and a
+partial write would erase a recurring reminder's repeat configuration.
+ntfy token scope: publish for the bridge topic.
 
 ## Webhook registration
 
@@ -77,8 +80,10 @@ to Docker Hub on `main` and on `v*` tags. Configure the repository variable
 
 ## Validation notes
 
-- Callback calls `POST /api/v1/tasks/{id}` with body `{"done":true}`
-  (PUT and PATCH return 405).
+- Callback reads the task (`GET /api/v1/tasks/{id}`) and posts the raw record
+  back whole with `done` flipped (`POST`; PUT and PATCH return 405). A partial
+  body would wipe repeats and reminders, and a struct-typed echo would drop
+  any field Go does not know (go-vikunja issue 1459).
 - Reminder body renders as `Reminder at Tue, 10/27 at 07:00 · *Inbox*`.
 
 ## Local testing
