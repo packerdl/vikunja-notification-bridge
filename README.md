@@ -68,8 +68,10 @@ notifications.example.com {
 ## Image builds
 
 GitHub Actions builds `linux/amd64` and `linux/arm64` images and pushes them
-to Docker Hub on `main` and on `v*` tags. Configure the repository variable
-`DOCKERHUB_NAMESPACE` and the secret `DOCKERHUB_TOKEN`.
+to GHCR (`ghcr.io/packerdl/vikunja-notification-bridge`) on `main` and on
+`v*` tags. No extra configuration needed, the workflow token handles it. Pulls
+outside GitHub require a token with `read:packages` unless the image is
+public.
 
 ## Local testing
 
